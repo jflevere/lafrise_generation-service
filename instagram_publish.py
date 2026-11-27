@@ -6,10 +6,13 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 class PublishError(RuntimeError):
@@ -72,6 +75,40 @@ def wait_for_container(call, identifier):
     raise PublishError("Le conteneur Meta est encore en traitement.")
 
 
+def download_archive_images(urls):
+    images = []
+    max_bytes = 8_000_000
+    for index, url in enumerate(urls, 1):
+        try:
+            with urlopen(url, timeout=25) as response:
+                image = response.read(max_bytes + 1)
+        except (URLError, TimeoutError, OSError, ValueError):
+            raise PublishError(f"Impossible de sauvegarder la carte {index}.") from None
+        if len(image) > max_bytes or not image.startswith(b"\xff\xd8\xff"):
+            raise PublishError(f"La carte {index} ne correspond pas à un JPEG admissible.")
+        images.append(image)
+    return images
+
+
+def write_archive(archive_dir, images, caption, media_id, permalink):
+    date = datetime.now(timezone.utc).isoformat()
+    destination = archive_dir / f"Carrousel_Instagram_{media_id}.zip"
+    with NamedTemporaryFile(dir=archive_dir, prefix=".carrousel-") as temporary:
+        with ZipFile(temporary, "w", ZIP_DEFLATED) as archive:
+            for index, image in enumerate(images, 1):
+                archive.writestr(f"Carte_{index:02d}.jpg", image)
+            archive.writestr("Legende_Instagram.txt", caption)
+            archive.writestr(
+                "Publication.json",
+                json.dumps({"media_id": media_id, "permalink": permalink, "archived_at": date},
+                           ensure_ascii=False, indent=2) + "\n",
+            )
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        os.link(temporary.name, destination)
+    return destination
+
+
 def publish_carousel(job, account, call, receipt_path):
     children = []
     for url in job["image_urls"]:
@@ -107,7 +144,7 @@ def publish_container(account, call, container_id, receipt_path):
     return state
 
 
-def publish(job, account, call, receipt_path):
+def publish(job, account, call, receipt_path, *, archive_dir=None):
     validate_job(job)
     if receipt_path.exists():
         raise PublishError("Ce reçu existe déjà. Vérifier le résultat avant toute relance.")
@@ -116,8 +153,23 @@ def publish(job, account, call, receipt_path):
     if story_url and story_receipt.exists():
         raise PublishError("Le reçu de story existe déjà. Vérifier le résultat avant toute relance.")
 
+    if archive_dir is not None:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        images = download_archive_images(job["image_urls"])
     state = publish_carousel(job, account, call, receipt_path)
     media = state["media_id"]
+    permalink = None
+    if archive_dir is not None:
+        try:
+            permalink = call(media, params={"fields": "permalink"}).get("permalink")
+        except PublishError as exc:
+            print(f"Carrousel {media} publié. Lien à vérifier. {exc}", file=sys.stderr)
+        try:
+            archive_path = write_archive(archive_dir, images, job.get("caption", ""), media, permalink)
+            state["archive"] = str(archive_path)
+        except OSError as exc:
+            print(f"Carrousel {media} publié. Archive en échec. {exc}", file=sys.stderr)
+            state["archive_error"] = str(exc)
     if story_url:
         try:
             story = object_id(call(f"{account}/media", form={
@@ -128,7 +180,8 @@ def publish(job, account, call, receipt_path):
         except (PublishError, OSError) as exc:
             raise PublishError(f"Carrousel {media} publié. Story à vérifier. {exc}") from None
 
-    permalink = call(media, params={"fields": "permalink"}).get("permalink")
+    if archive_dir is None:
+        permalink = call(media, params={"fields": "permalink"}).get("permalink")
     return dict(state, permalink=permalink)
 
 
@@ -137,6 +190,7 @@ def main():
     parser.add_argument("manifest", type=Path, nargs="?")
     parser.add_argument("--check-account", action="store_true")
     parser.add_argument("--receipt", type=Path)
+    parser.add_argument("--archive-dir", type=Path, help="Dossier durable des carrousels publiés")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -176,8 +230,9 @@ def main():
         def call(path, **kwargs):
             return graph_call(version, token, path, host=host, **kwargs)
 
-        print(json.dumps(publish(job, account, call, args.receipt)))
-        return 0
+        result = publish(job, account, call, args.receipt, archive_dir=args.archive_dir)
+        print(json.dumps(result))
+        return int("archive_error" in result)
     except (PublishError, OSError, ValueError) as exc:
         print(f"Publication interrompue. {exc}", file=sys.stderr)
         return 1
