@@ -1,4 +1,4 @@
-"""Publish an approved Instagram carousel from a job manifest."""
+"""Publish an approved Instagram carousel and optional Story from a job manifest."""
 
 import argparse
 import json
@@ -16,8 +16,8 @@ class PublishError(RuntimeError):
     pass
 
 
-def graph_call(version, token, path, *, params=None, form=None):
-    url = f"https://graph.instagram.com/{version}/{path}"
+def graph_call(version, token, path, *, params=None, form=None, host="graph.instagram.com"):
+    url = f"https://{host}/{version}/{path}"
     if params:
         url += "?" + urlencode(params)
     request = Request(
@@ -40,7 +40,10 @@ def validate_job(job):
         raise PublishError("Le carrousel doit être approuvé.")
     if not isinstance(urls, list) or not 2 <= len(urls) <= 10:
         raise PublishError("Le carrousel doit contenir 2 à 10 images JPEG.")
-    for url in urls:
+    media_urls = list(urls)
+    if "story_image_url" in job:
+        media_urls.append(job["story_image_url"])
+    for url in media_urls:
         if not isinstance(url, str):
             raise PublishError("Chaque image doit avoir une URL HTTPS.")
         parsed = urlsplit(url)
@@ -69,10 +72,7 @@ def wait_for_container(call, identifier):
     raise PublishError("Le conteneur Meta est encore en traitement.")
 
 
-def publish(job, account, call, receipt_path):
-    validate_job(job)
-    if receipt_path.exists():
-        raise PublishError("Ce reçu existe déjà. Vérifier le résultat avant toute relance.")
+def publish_carousel(job, account, call, receipt_path):
     children = []
     for url in job["image_urls"]:
         child = object_id(call(f"{account}/media", form={
@@ -87,19 +87,47 @@ def publish(job, account, call, receipt_path):
     }))
     wait_for_container(call, carousel)
 
+    return publish_container(account, call, carousel, receipt_path)
+
+
+def publish_container(account, call, container_id, receipt_path):
     # Reserve the publication before the irreversible call, including with concurrent workers.
     with receipt_path.open("x", encoding="utf-8") as receipt:
-        state = {"container_id": carousel, "status": "publication_uncertain"}
+        state = {"container_id": container_id, "status": "publication_uncertain"}
         json.dump(state, receipt)
         receipt.write("\n")
         receipt.flush()
         os.fsync(receipt.fileno())
-        media = object_id(call(f"{account}/media_publish", form={"creation_id": carousel}))
-        state = {"container_id": carousel, "status": "published", "media_id": media}
+        media = object_id(call(f"{account}/media_publish", form={"creation_id": container_id}))
+        state = {"container_id": container_id, "status": "published", "media_id": media}
         json.dump(state, receipt)
         receipt.write("\n")
         receipt.flush()
         os.fsync(receipt.fileno())
+    return state
+
+
+def publish(job, account, call, receipt_path):
+    validate_job(job)
+    if receipt_path.exists():
+        raise PublishError("Ce reçu existe déjà. Vérifier le résultat avant toute relance.")
+    story_url = job.get("story_image_url")
+    story_receipt = receipt_path.with_name(receipt_path.name + ".story")
+    if story_url and story_receipt.exists():
+        raise PublishError("Le reçu de story existe déjà. Vérifier le résultat avant toute relance.")
+
+    state = publish_carousel(job, account, call, receipt_path)
+    media = state["media_id"]
+    if story_url:
+        try:
+            story = object_id(call(f"{account}/media", form={
+                "media_type": "STORIES", "image_url": story_url,
+            }))
+            wait_for_container(call, story)
+            state["story"] = publish_container(account, call, story, story_receipt)
+        except (PublishError, OSError) as exc:
+            raise PublishError(f"Carrousel {media} publié. Story à vérifier. {exc}") from None
+
     permalink = call(media, params={"fields": "permalink"}).get("permalink")
     return dict(state, permalink=permalink)
 
@@ -139,11 +167,14 @@ def main():
         account = os.environ.get("INSTAGRAM_ACCOUNT_ID", "")
         version = os.environ.get("INSTAGRAM_API_VERSION", "")
         token = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
+        host = os.environ.get("INSTAGRAM_GRAPH_HOST", "graph.instagram.com")
         if not token or not re.fullmatch(r"[0-9]+", account) or not re.fullmatch(r"v[0-9]+\.[0-9]+", version):
             raise PublishError("La configuration Instagram est incomplète.")
+        if host not in {"graph.instagram.com", "graph.facebook.com"}:
+            raise PublishError("Hôte Meta invalide.")
 
         def call(path, **kwargs):
-            return graph_call(version, token, path, **kwargs)
+            return graph_call(version, token, path, host=host, **kwargs)
 
         print(json.dumps(publish(job, account, call, args.receipt)))
         return 0
