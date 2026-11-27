@@ -106,12 +106,27 @@ def publish(job, account, call, receipt_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("manifest", type=Path)
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--check-account", action="store_true")
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     try:
+        if args.check_account:
+            version = os.environ.get("INSTAGRAM_API_VERSION", "")
+            token = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
+            if not token or not re.fullmatch(r"v[0-9]+\.[0-9]+", version):
+                raise PublishError("Le jeton Instagram et la version API sont requis.")
+            account = graph_call(version, token, "me", params={"fields": "user_id,username"})
+            account_id = str(account.get("user_id", ""))
+            username = account.get("username")
+            if not re.fullmatch(r"[0-9]+", account_id) or not isinstance(username, str) or not username:
+                raise PublishError("Meta n’a pas retourné le compte Instagram attendu.")
+            print(json.dumps({"account_id": account_id, "username": username}))
+            return 0
+        if args.manifest is None:
+            raise PublishError("Un manifeste est requis pour publier ou simuler.")
         job = json.loads(args.manifest.read_text(encoding="utf-8"))
         if not isinstance(job, dict):
             raise PublishError("Le manifeste doit être un objet JSON.")
