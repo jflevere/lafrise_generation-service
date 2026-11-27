@@ -264,6 +264,7 @@ def generate():
     niveau = payload.get("niveau_verification", "non évalué")
     slides = payload.get("slides", [])
     generer_video = payload.get("generer_video", True)
+    export_instagram_jpeg = payload.get("export_instagram_jpeg") is True
     dry_run = payload.get("dry_run", False)  # utile pour tester le service sans consommer de crédits OpenAI
 
     if not slides:
@@ -295,7 +296,16 @@ def generate():
 
     slides_urls = [f"{PUBLIC_BASE_URL}/files/{sujet_dir.name}/final/{p.name}" for p in final_paths]
 
-    return jsonify({"sujet_id": sujet_id, "slides_urls": slides_urls, "video_url": video_url})
+    result = {"sujet_id": sujet_id, "slides_urls": slides_urls, "video_url": video_url}
+    if export_instagram_jpeg:
+        instagram_urls = []
+        for path in final_paths:
+            jpeg_path = path.with_suffix(".jpg")
+            with Image.open(path) as slide:
+                slide.convert("RGB").save(jpeg_path, format="JPEG", quality=95, subsampling=0)
+            instagram_urls.append(f"{PUBLIC_BASE_URL}/files/{sujet_dir.name}/final/{jpeg_path.name}")
+        result["instagram_image_urls"] = instagram_urls
+    return jsonify(result)
 
 
 @app.route("/files/<path:filepath>")
